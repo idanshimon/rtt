@@ -1529,6 +1529,12 @@ def print_runtime_config(cfg, transcript_path: Path) -> None:
               "sample_rate": cfg["sample_rate"],
               "block_seconds": cfg["block_duration"],
               "output": str(transcript_path.resolve())}
+    values["audio_destination"] = ("on this device (Whisper)" if backend == BACKEND_LOCAL else
+                                   "configured VibeVoice server" if backend == BACKEND_VIBE else
+                                   "configured Azure resource")
+    summary_service = "configured summary endpoint" if os.environ.get("RTT_COPILOT_URL") else "GitHub Copilot"
+    values["live_summary"] = (f"ON: sends transcript text to {summary_service} (opt out: --no-summary)"
+                              if cfg["summary"] else "OFF: no transcript sent for summaries (enable: --summary)")
     if cfg["input_file"]:
         values.update(skip_seconds=cfg["skip_seconds"], max_seconds=cfg["max_seconds"])
     else:

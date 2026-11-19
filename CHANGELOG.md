@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Try local Whisper with an included 20-second synthetic recording: `.venv/bin/python demo/run.py`.
+- Startup and `--show-config` show separate audio and live-summary destinations. Summaries remain on by default, including for Whisper; `--no-summary` disables and `--summary` re-enables them.
+
 ## 2026-11-18 (ready for public release)
 - Packaging: MIT `LICENSE`, `NOTICE.md` (third-party licenses), `SECURITY.md` (what leaves your machine, recording consent), `CONTRIBUTING.md`, `requirements-dev.txt`, GitHub Actions tests on Python 3.11 and 3.12 (3.9 is tested locally).
 - New README with a rendered screenshot of the split view (`scripts/render_readme_screenshot.py`, invented meeting); the long usage text moved to `docs/USAGE.md`; new `docs/ARCHITECTURE.md`.

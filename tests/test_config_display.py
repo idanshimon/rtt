@@ -40,6 +40,26 @@ def test_all_backend_summaries(isolated, backend, expected):
     assert expected in result.output
 
 
+@pytest.mark.parametrize('setting,flags,expected', [
+    (None, [], 'ON: sends transcript text to GitHub Copilot'),
+    (None, ['--no-summary'], 'OFF: no transcript sent for summaries'),
+    ('0', [], 'OFF: no transcript sent for summaries'),
+    ('0', ['--summary'], 'ON: sends transcript text to GitHub Copilot'),
+    ('1', ['--no-summary'], 'OFF: no transcript sent for summaries'),
+])
+def test_local_audio_and_summary_choices(tmp_path, setting, flags, expected):
+    import os
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('RTT_', 'AZURE_SPEECH_'))}
+    if setting is not None:
+        env['RTT_SUMMARY'] = setting
+    result = subprocess.run([sys.executable, transcribe.__file__, '--backend', 'local', '--show-config', *flags],
+                            cwd=tmp_path, env=env, text=True, capture_output=True, check=True)
+    assert 'audio_destination: on this device (Whisper)' in result.stdout
+    assert 'live_summary: ' + expected in result.stdout
+    assert not list(tmp_path.iterdir())
+
+
 def test_cli_endpoint_wins_and_secrets_are_not_printed(isolated):
     monkeypatch, _ = isolated
     monkeypatch.setenv('RTT_OPENAI_ENDPOINT', 'https://env.test/')

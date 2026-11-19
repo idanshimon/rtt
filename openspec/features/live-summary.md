@@ -6,6 +6,7 @@ Status: shipped 2026-11-05.
 During a meeting there was no running picture of what was decided and who owes what.
 
 ## Behavior
+- On by default even for local transcription: startup displays the audio destination and whether transcript text is sent for summaries. Opt out with `--no-summary` or `RTT_SUMMARY=0`; opt back in with `--summary` or `RTT_SUMMARY=1`. CLI flags override the environment.
 - Right panel of the split view: Summary · Decisions · Action items · Open questions.
 - Incremental: each update sends the current summary plus only the new lines; every
   `RTT_SUMMARY_INTERVAL` seconds (60) or on `n`. A final update runs at stop (bounded, see

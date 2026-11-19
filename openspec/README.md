@@ -16,7 +16,7 @@ Code is the source of truth; when a spec and the code disagree, fix the spec in 
 | [mcp-server](features/mcp-server.md) | MCP server: agents start RTT, run every action, read transcript/summary | shipped 2026-11-13 |
 | [speaker-rename-hotkey](features/speaker-rename-hotkey.md) | original rename (Ctrl+R / `r`), speaker map | shipped 2026-05; extended |
 | [speaker-tracking](features/speaker-tracking.md) | stable speaker ids across chunks, click-to-rename, renames in summary, spoken time per line | shipped 2026-11-06 |
-| [live-summary](features/live-summary.md) | Copilot gpt-6.1-terra incremental summary, copy keys | shipped 2026-11-05 |
+| [live-summary](features/live-summary.md) | Copilot gpt-6.1-terra incremental summary (on by default; `--no-summary` / `--summary`), copy keys | shipped 2026-11-05 |
 | [audio-recording-and-second-pass](features/audio-recording-and-second-pass.md) | `--record`, tracks, `rtt-post`, "me" attribution | shipped 2026-11-05/06 |
 | [off-the-record](features/off-the-record.md) | delete the last N minutes everywhere | shipped 2026-11-06 |
 | [live-backend-switch](features/live-backend-switch.md) | change backend mid-session | shipped 2026-11-06 |

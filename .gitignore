@@ -29,6 +29,7 @@ env/
 transcripts/
 *.mp3
 *.wav
+!/demo/garden.wav
 *.flac
 test_*.py
 !tests/test_*.py
