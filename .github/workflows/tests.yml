@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: System audio libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2 libsndfile1 pulseaudio
+          # sounddevice initialises PortAudio on import; give it a sound server with no hardware
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Test
+        run: python -m pytest tests -q

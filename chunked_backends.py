@@ -1,0 +1,727 @@
+"""Chunked HTTP transcription backends for RTT.
+
+These back the newer Azure model paths that do NOT support the Speech SDK's
+continuous streaming recognition:
+
+  - OpenAITranscribeBackend  → Azure OpenAI `gpt-4o-transcribe-diarize`
+        via POST /openai/deployments/<dep>/audio/transcriptions
+        (response_format=diarized_json → segments[].speaker/.text)
+  - LLMSpeechBackend         → Azure Speech "LLM Speech" fast-transcription
+        via POST /speechtotext/transcriptions:transcribe (enhancedMode)
+
+Both share the same micro-batch design: audio frames are buffered into
+N-second chunks, each chunk is WAV-encoded and POSTed, and the returned
+text (with speaker labels when available) is emitted. This trades true
+real-time latency for model quality + diarization — see AGENTS.md.
+
+Auth reuses the same AAD token_provider discipline as AzureSpeechBackend:
+a callable that mints a FRESH bearer token on demand (tokens expire ~60 min).
+
+Design notes
+------------
+* Chunk window default = 10s (tunable via --chunk-seconds). Shorter feels
+  more live but cuts mid-sentence and resets diarization more often; longer
+  is more accurate but lands further behind the speaker.
+* Cross-chunk speaker-number stability is NOT guaranteed (chunk 1 "Speaker 1"
+  may be chunk 2 "Speaker 2"). Acceptable for A/B eval; speaker-stitching is
+  a future enhancement, not v1.
+* Network failures on a single chunk are logged and skipped, never fatal —
+  one dropped chunk must not kill the meeting (same resilience philosophy as
+  the AzureSpeechBackend 401 auto-recovery).
+"""
+
+from __future__ import annotations
+
+import io
+import queue
+import threading
+import time
+import wave
+from typing import Callable, List, Optional, Tuple, Union
+
+# A token provider returns either a bare token string or (token, expires_on_epoch).
+TokenProvider = Callable[[], Union[str, Tuple[str, float]]]
+
+# HTTP statuses worth a short bounded retry: transient server-side blips and
+# throttling. A sustained outage across these still escalates loudly (see
+# ChunkedHTTPBackend._record_failure) rather than silently dropping audio.
+# 401/403 are handled separately (token refresh), NOT here.
+_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+
+import numpy as np
+import requests
+import typer
+
+from chunk_policy import ChunkPolicy, quietest_cut
+from speakers import SpokenLine
+
+from corrections import Corrections
+
+
+class ChunkedHTTPBackend:
+    CHUNK_MIN = 3.0     # seconds; shorter chunks lose context and diarization
+    CHUNK_MAX = 60.0
+
+    """Base class: buffers audio into fixed-duration chunks and POSTs each.
+
+    Subclasses implement `_transcribe_chunk(wav_bytes) -> List[str]` returning
+    already-formatted transcript lines (e.g. "Speaker 1: hello").
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        chunk_seconds: float = 10.0,
+        token_provider: Optional["TokenProvider"] = None,
+        api_key: Optional[str] = None,
+        request_timeout: float = 60.0,
+    ) -> None:
+        self._sample_rate = sample_rate
+        self._chunk_seconds = chunk_seconds
+        self._token_provider = token_provider
+        self._api_key = api_key
+        self._request_timeout = request_timeout
+        # Bounds widen to include an explicit --chunk-seconds so CLI values are never overridden.
+        self.policy = ChunkPolicy(chunk_seconds, lo=min(self.CHUNK_MIN, chunk_seconds),
+                                  hi=max(self.CHUNK_MAX, chunk_seconds))
+        self._url: str = ""  # set by subclass __init__; used by _post()
+        self._buffer = np.empty((0,), dtype=np.float32)
+        self._buffer_t0: Optional[float] = None   # wall-clock time of the first buffered sample
+        self.tracker = None                       # SpeakerTracker (global speaker ids), optional
+        self._text_queue: "queue.Queue[str]" = queue.Queue()
+        self._stop_event = threading.Event()
+        # Token cache. The provider may return either a bare token string OR a
+        # (token, expires_on_epoch) tuple. When the real expiry is known we
+        # refresh 5 min before it; otherwise we fall back to a conservative TTL.
+        # NOTE: with AzureCliCredential the token is SHARED with `az` and can be
+        # handed over already-aged (<30 min life), so a blind wall-clock TTL is a
+        # lie — honoring the real `expires_on` is what prevents the mid-meeting
+        # death. Reactive 401 recovery (see _post) is the belt-and-suspenders.
+        self._cached_token: Optional[str] = None
+        self._token_expiry: float = 0.0   # real epoch expiry when provider supplies it
+        self._token_ts: float = 0.0
+        self._token_ttl = 1800.0          # fallback only when expiry is unknown
+        self._token_refresh_margin = 300.0
+        self._token_lock = threading.Lock()
+        # Transient-failure retry + health tracking. A single blip (429/5xx) is
+        # retried in-process with short backoff so we don't drop that chunk. A
+        # SUSTAINED outage (many consecutive failures) is escalated LOUDLY into
+        # the transcript exactly once, so a 20-min backend outage can't silently
+        # masquerade as one bad chunk (as the 2026-07-06 HTTP 500 outage did).
+        self._max_transient_retries = 2      # per-chunk in-request retries
+        self._retry_backoff = 1.5            # seconds, ×attempt
+        self._consecutive_failures = 0
+        self._unhealthy = False              # True once we've escalated "DOWN"
+        self._escalate_after = 3             # consecutive failures → escalate
+        # Vocabulary corrections applied to each emitted line (domain-term
+        # de-garbling, e.g. "high trust" → "HITRUST"). Loaded from
+        # corrections.json; fails open to a no-op if absent/unparseable.
+        self._corrections = Corrections.load()
+
+    # --- auth -------------------------------------------------------------
+    def _auth_header(self, force_refresh: bool = False) -> dict:
+        if self._api_key:
+            return {"Ocp-Apim-Subscription-Key": self._api_key}
+        token = self._get_token(force_refresh=force_refresh)
+        return {"Authorization": f"Bearer {token}"}
+
+    def _get_token(self, force_refresh: bool = False) -> str:
+        if self._token_provider is None:
+            raise RuntimeError("No api_key and no token_provider configured.")
+        now = time.time()
+        with self._token_lock:
+            if self._token_expiry:
+                stale = now >= (self._token_expiry - self._token_refresh_margin)
+            else:
+                stale = (now - self._token_ts) > self._token_ttl
+            if force_refresh or self._cached_token is None or stale:
+                result = self._token_provider()
+                if isinstance(result, tuple):
+                    self._cached_token = result[0]
+                    self._token_expiry = float(result[1])
+                else:
+                    self._cached_token = result
+                    self._token_expiry = 0.0
+                self._token_ts = now
+            return self._cached_token
+
+    def _invalidate_token(self) -> None:
+        """Drop the cached token so the next _get_token mints a fresh one.
+
+        Called after a 401/403 so an expired token can't be re-sent forever.
+        Forcing a re-mint after expiry makes AzureCliCredential/MSAL refresh the
+        underlying `az` token instead of returning the dead cached one.
+        """
+        with self._token_lock:
+            self._cached_token = None
+            self._token_expiry = 0.0
+
+    def _post(self, *, files, data=None) -> "requests.Response":
+        """POST to self._url with AAD/key auth, one-shot 401 recovery, and
+        bounded retry on transient 5xx/429.
+
+        Shared by all chunked subclasses so recovery lives in ONE place:
+        - 401/403 (AAD): invalidate the cached token, force a fresh mint, retry
+          once — the mid-meeting token-expiry self-heal.
+        - 429/5xx: retry up to `_max_transient_retries` times with linear
+          backoff — a brief Azure blip recovers instead of dropping that chunk.
+        A file payload (BytesIO) can be consumed by the first send, so we build
+        the multipart fresh on each attempt via the passed-in bytes/dicts, which
+        are safe to re-send.
+        Returns the final Response (caller decides on non-200); a network-level
+        exception on the LAST attempt propagates to the caller.
+        """
+        token_refreshed = False
+        last_exc: Optional[Exception] = None
+        resp: Optional["requests.Response"] = None
+        # total attempts = 1 initial + transient retries
+        for attempt in range(self._max_transient_retries + 1):
+            try:
+                resp = requests.post(
+                    self._url,
+                    headers=self._auth_header(),
+                    files=files,
+                    data=data,
+                    timeout=self._request_timeout,
+                )
+            except requests.RequestException as exc:
+                # Network-level failure (DNS, connection reset, read timeout) is
+                # itself transient — back off and retry, same as a 5xx.
+                last_exc = exc
+                if attempt < self._max_transient_retries:
+                    time.sleep(self._retry_backoff * (attempt + 1))
+                    continue
+                raise
+
+            # AAD token death: one forced refresh + immediate retry (does NOT
+            # consume the transient budget — it's a distinct failure mode).
+            if (
+                resp.status_code in (401, 403)
+                and self._token_provider is not None
+                and not token_refreshed
+            ):
+                typer.echo(
+                    f"[{self.__class__.__name__}] auth {resp.status_code} — "
+                    f"refreshing AAD token and retrying chunk",
+                    err=True,
+                )
+                self._invalidate_token()
+                token_refreshed = True
+                resp = requests.post(
+                    self._url,
+                    headers=self._auth_header(force_refresh=True),
+                    files=files,
+                    data=data,
+                    timeout=self._request_timeout,
+                )
+
+            # Transient server blip / throttle: back off and retry.
+            if (
+                resp.status_code in _TRANSIENT_STATUS
+                and attempt < self._max_transient_retries
+            ):
+                time.sleep(self._retry_backoff * (attempt + 1))
+                continue
+
+            return resp
+
+        # Exhausted retries on transient status — return the last response so the
+        # caller raises with the real status (feeds health tracking).
+        if last_exc is not None:
+            raise last_exc
+        assert resp is not None  # loop runs ≥1 time (_max_transient_retries ≥ 0)
+        return resp
+
+    # --- audio framing ----------------------------------------------------
+    @staticmethod
+    def _wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+        """Encode a float32 [-1,1] mono array as 16-bit PCM WAV bytes."""
+        pcm = (np.clip(np.squeeze(audio), -1.0, 1.0) * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+        return buf.getvalue()
+
+    def push_audio(self, audio: np.ndarray, captured_at: Optional[float] = None) -> None:
+        a = np.squeeze(audio)
+        if self._buffer.size == 0 or self._buffer_t0 is None:
+            end = captured_at if captured_at is not None else time.time()
+            self._buffer_t0 = end - a.shape[0] / self._sample_rate
+        self._buffer = np.concatenate((self._buffer, a))
+
+    @property
+    def _samples_per_chunk(self) -> int:
+        return self.policy.samples(self._sample_rate)
+
+    def attach_policy(self, policy: ChunkPolicy) -> None:
+        """Share one policy across backends so UI changes and switches keep the same setting."""
+        policy.bounds(self.CHUNK_MIN, self.CHUNK_MAX)
+        self.policy = policy
+
+    def _drain_ready_chunk(self, force: bool = False) -> Optional[np.ndarray]:
+        """Return one chunk of audio if buffered, else None.
+
+        Fixed mode cuts exactly at the chunk length. Auto mode cuts at the quietest moment in
+        the last 40% of the window so a word or sentence is not split between chunks.
+        force=True flushes whatever remains (used at end-of-stream)."""
+        n = self._samples_per_chunk
+        if self._buffer.shape[0] >= n:
+            cut = n
+            if self.policy.mode == "auto":
+                cut, quiet = quietest_cut(self._buffer, self._sample_rate, int(0.6 * n), n)
+                if quiet:
+                    self.policy.quiet_cuts += 1
+                else:
+                    self.policy.hard_cuts += 1
+            chunk = self._buffer[:cut]
+            self._buffer = self._buffer[cut:]
+            self._last_chunk_t0 = self._buffer_t0
+            if self._buffer_t0 is not None:
+                self._buffer_t0 += cut / self._sample_rate
+            return chunk
+        if force and self._buffer.size:
+            chunk = self._buffer
+            self._buffer = np.empty((0,), dtype=np.float32)
+            self._last_chunk_t0 = self._buffer_t0
+            self._buffer_t0 = None
+            return chunk
+        return None
+
+    # --- subclass hook ----------------------------------------------------
+    def _transcribe_chunk(self, wav_bytes: bytes) -> List[str]:
+        raise NotImplementedError
+
+    def transcribe_ready(self, force: bool = False) -> None:
+        """Encode + POST any ready chunk, queueing resulting lines.
+
+        On failure a single chunk is never fatal, but SUSTAINED failures are
+        escalated once (see _record_failure) so a backend outage is visible in
+        the transcript instead of silently dropping minutes of audio.
+        """
+        chunk = self._drain_ready_chunk(force=force)
+        if chunk is None:
+            return
+        # Skip near-silent chunks (avoids paying for empty POSTs). RMS gate.
+        if float(np.sqrt(np.mean(np.square(chunk)))) < 1e-4:
+            return
+        wav = self._wav_bytes(chunk, self._sample_rate)
+        t0 = time.time()
+        try:
+            lines = self._transcribe_chunk(wav)
+        except Exception as exc:  # noqa: BLE001 — a dropped chunk must not kill the run
+            typer.echo(f"[{self.__class__.__name__}] chunk failed: {exc}", err=True)
+            self._record_failure(exc)
+            return
+        self.policy.report(chunk.shape[0] / self._sample_rate, time.time() - t0,
+                           self._buffer.shape[0] / self._sample_rate)
+        self._record_success()
+        lines = [ln for ln in lines if ln and ln.strip()]
+        if self.tracker is not None:
+            try:
+                lines = self.tracker.relabel(chunk, self._sample_rate, lines)
+            except Exception as exc:  # noqa: BLE001 — never lose text over speaker matching
+                typer.echo(f"[speakers] relabel failed: {exc}", err=True)
+        chunk_t0 = getattr(self, "_last_chunk_t0", None)
+        for line in lines:
+            text = self._corrections.apply(line.strip())
+            st = getattr(line, "start", None)
+            out = SpokenLine(text, st, getattr(line, "end", None), getattr(line, "label", None))
+            if chunk_t0 is not None:
+                out.t = chunk_t0 + (st if st is not None else 0.0)
+            self._text_queue.put(out)
+
+    def _record_success(self) -> None:
+        """Reset the failure streak; announce recovery if we were unhealthy."""
+        if self._unhealthy:
+            self._text_queue.put(
+                "⚠️ RTT RECOVERED — transcription backend is responding again."
+            )
+            typer.echo(
+                f"[{self.__class__.__name__}] backend recovered after "
+                f"{self._consecutive_failures} consecutive failures",
+                err=True,
+            )
+        self._unhealthy = False
+        self._consecutive_failures = 0
+
+    def _record_failure(self, exc: Exception) -> None:
+        """Count a failed chunk; escalate LOUDLY the first time we cross the
+        consecutive-failure threshold, so a long outage can't masquerade as one
+        dropped chunk (the 2026-07-06 HTTP 500 outage dropped ~23 min silently).
+        """
+        self._consecutive_failures += 1
+        if not self._unhealthy and self._consecutive_failures >= self._escalate_after:
+            self._unhealthy = True
+            msg = (
+                f"⚠️ RTT BACKEND DOWN — {self._consecutive_failures} consecutive "
+                f"chunks failed ({type(exc).__name__}: {str(exc)[:120]}). "
+                f"Audio is being DROPPED until it recovers. "
+                f"Consider switching backend (rttheb / rttold / local)."
+            )
+            self._text_queue.put(msg)
+            typer.echo(f"[{self.__class__.__name__}] {msg}", err=True)
+
+    def drain_text(self) -> List[str]:
+        lines: List[str] = []
+        while True:
+            try:
+                lines.append(self._text_queue.get_nowait())
+            except queue.Empty:
+                break
+        return lines
+
+    def start(self) -> None:  # symmetry with AzureSpeechBackend
+        pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+class VibeVoiceLocalBackend(ChunkedHTTPBackend):
+    CHUNK_MIN = 10.0    # the 7B model needs context for speakers; fixed overhead per call
+    CHUNK_MAX = 120.0
+
+    """Local VibeVoice-ASR (7B) served by speech-bench/vibe_server.py on loopback.
+
+    No auth, no cloud. The model is offline (whole-clip) so this is chunked
+    micro-batching like the Azure backends. Speaker ids come from the model
+    per chunk and are NOT guaranteed stable across chunks; lines are tagged
+    with the chunk-local id only.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        chunk_seconds: float = 30.0,
+        url: str = "http://127.0.0.1:8765",
+        prompt: Optional[str] = None,
+    ) -> None:
+        super().__init__(sample_rate, chunk_seconds, request_timeout=300.0)
+        self._url = url.rstrip("/") + "/transcribe"
+        if not prompt:
+            from corrections import phrase_list
+            terms = phrase_list(200)
+            prompt = ("Terms: " + ", ".join(terms)) if terms else None
+        self._prompt = prompt
+
+    def _auth_header(self, force_refresh: bool = False) -> dict:
+        h = {"Content-Type": "audio/wav"}
+        if self._prompt:
+            from urllib.parse import quote
+            h["X-Prompt"] = quote(self._prompt)
+        return h
+
+    def _transcribe_chunk(self, wav_bytes: bytes) -> List[str]:
+        resp = self._post(files=None, data=wav_bytes)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return self._format_segments(resp.json().get("segments") or [])
+
+    @staticmethod
+    def _format_segments(segments: list) -> List[str]:
+        lines: List[str] = []
+        for seg in segments:
+            text = (seg.get("Content") or "").strip()
+            # Drop non-speech tags the model emits for music/noise ("[Music]").
+            if not text or (text.startswith("[") and text.endswith("]")):
+                continue
+            spk = seg.get("Speaker")
+            st, en = seg.get("Start"), seg.get("End")
+            st = float(st) if isinstance(st, (int, float)) else None
+            en = float(en) if isinstance(en, (int, float)) else None
+            if spk is not None:
+                lines.append(SpokenLine(f"Speaker {spk}: {text}", st, en, str(spk)))
+            else:
+                lines.append(SpokenLine(text, st, en))
+        return lines
+
+
+class OpenAITranscribeBackend(ChunkedHTTPBackend):
+    """Azure OpenAI gpt-4o-transcribe-diarize via the /audio/transcriptions API.
+
+    Uses response_format=diarized_json → the response carries segments[] each
+    with .speaker and .text, which we format as "Speaker <id>: <text>".
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        deployment: str,
+        sample_rate: int,
+        chunk_seconds: float = 10.0,
+        api_version: str = "2024-10-21",
+        language: Optional[str] = None,
+        temperature: Optional[float] = 0.0,
+        token_provider: Optional["TokenProvider"] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        super().__init__(sample_rate, chunk_seconds, token_provider, api_key)
+        base = endpoint.rstrip("/")
+        self._url = (
+            f"{base}/openai/deployments/{deployment}"
+            f"/audio/transcriptions?api-version={api_version}"
+        )
+        self._deployment = deployment
+        self._language = language
+        self._temperature = temperature
+
+    def _transcribe_chunk(self, wav_bytes: bytes) -> List[str]:
+        files = {"file": ("chunk.wav", wav_bytes, "audio/wav")}
+        data = {
+            "model": self._deployment,
+            "response_format": "diarized_json",
+        }
+        if self._language:
+            # NOTE: the diarize model is documented to sometimes ignore
+            # `language` on the realtime path; on this batch path it is honored.
+            data["language"] = self._language
+        if self._temperature is not None:
+            # Pin determinism for jargon/number-heavy speech.
+            data["temperature"] = str(self._temperature)
+        resp = self._post(files=files, data=data)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        payload = resp.json()
+        return self._format_diarized(payload)
+
+    @staticmethod
+    def _format_diarized(payload: dict) -> List[str]:
+        """Turn a diarized_json payload into 'Speaker N: text' lines.
+
+        Handles both the segment-list shape (segments[].speaker/.text) and a
+        plain {text:...} fallback when diarization data is absent."""
+        segments = payload.get("segments")
+        lines: List[str] = []
+        if isinstance(segments, list) and segments:
+            for seg in segments:
+                text = (seg.get("text") or "").strip()
+                if not text:
+                    continue
+                spk = seg.get("speaker")
+                st, en = seg.get("start"), seg.get("end")
+                st = float(st) if isinstance(st, (int, float)) else None
+                en = float(en) if isinstance(en, (int, float)) else None
+                if spk is not None and spk != "":
+                    lines.append(SpokenLine(f"Speaker {spk}: {text}", st, en, str(spk)))
+                else:
+                    lines.append(SpokenLine(text, st, en))
+            return lines
+        # Fallback: no diarization, just the combined text.
+        text = (payload.get("text") or "").strip()
+        return [text] if text else []
+
+
+class LLMSpeechBackend(ChunkedHTTPBackend):
+    """Azure Speech "LLM Speech" fast-transcription via enhancedMode.
+
+    POST /speechtotext/transcriptions:transcribe with a definition enabling
+    enhancedMode + diarization. Multilingual by default (auto-detects), which
+    is why this is the Hebrew/English code-switch path. Response carries
+    phrases[] each with .speaker and .text.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        sample_rate: int,
+        chunk_seconds: float = 10.0,
+        api_version: str = "2025-10-15",
+        max_speakers: int = 4,
+        locales: Optional[List[str]] = None,
+        token_provider: Optional["TokenProvider"] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        super().__init__(sample_rate, chunk_seconds, token_provider, api_key)
+        base = endpoint.rstrip("/")
+        self._url = (
+            f"{base}/speechtotext/transcriptions:transcribe"
+            f"?api-version={api_version}"
+        )
+        self._max_speakers = max_speakers
+        self._locales = locales  # e.g. ["en-US","he-IL"] to bias; None = auto
+        from corrections import phrase_list
+        self._phrases = phrase_list()   # domain terms (vocabulary.json + private) as a phrase list
+
+    def _build_definition(self) -> dict:
+        """Build the fast-transcription `definition` payload.
+
+        Extracted so subclasses (e.g. MAITranscribeBackend) can select a model
+        and change the diarization shape without reimplementing the POST. The
+        classic LLM Speech path enables enhancedMode with NO model selection and
+        a bounded maxSpeakers.
+        """
+        definition: dict = {
+            "enhancedMode": {"enabled": True, "task": "transcribe"},
+            "diarization": {"maxSpeakers": self._max_speakers, "enabled": True},
+        }
+        if self._locales:
+            definition["locales"] = self._locales
+        if self._phrases:
+            # Documented for fast transcription / LLM Speech with api-version 2025-10-15.
+            definition["phraseList"] = {"phrases": self._phrases}
+        return definition
+
+    def _transcribe_chunk(self, wav_bytes: bytes) -> List[str]:
+        import json as _json
+
+        definition = self._build_definition()
+        files = {
+            "audio": ("chunk.wav", wav_bytes, "audio/wav"),
+            "definition": (None, _json.dumps(definition)),
+        }
+        resp = self._post(files=files)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return self._format_phrases(resp.json())
+
+    @staticmethod
+    def _format_phrases(payload: dict) -> List[str]:
+        """Turn a fast-transcription payload into 'Speaker N: text' lines."""
+        phrases = payload.get("phrases")
+        lines: List[str] = []
+        if isinstance(phrases, list) and phrases:
+            for ph in phrases:
+                text = (ph.get("text") or "").strip()
+                if not text:
+                    continue
+                spk = ph.get("speaker")
+                off, dur = ph.get("offsetMilliseconds"), ph.get("durationMilliseconds")
+                st = off / 1000.0 if isinstance(off, (int, float)) else None
+                en = (off + dur) / 1000.0 if isinstance(off, (int, float)) and isinstance(dur, (int, float)) else None
+                if spk is not None and spk != "":
+                    lines.append(SpokenLine(f"Speaker {spk}: {text}", st, en, str(spk)))
+                else:
+                    lines.append(SpokenLine(text, st, en))
+            return lines
+        # Fallback to combinedPhrases when no per-phrase diarization present.
+        combined = payload.get("combinedPhrases")
+        if isinstance(combined, list) and combined:
+            out = []
+            for c in combined:
+                t = (c.get("text") or "").strip()
+                if t:
+                    out.append(t)
+            return out
+        return []
+
+
+class MAITranscribeBackend(LLMSpeechBackend):
+    """Azure Speech fast-transcription with the MAI-Transcribe-2 model.
+
+    MAI-Transcribe-2 is the diarization-capable Microsoft AI transcription model
+    reachable on the SAME REST surface as LLM Speech
+    (/speechtotext/transcriptions:transcribe). It differs from the stock LLM
+    Speech path in exactly two ways, both verified empirically against the DEV
+    Speech resource (HTTP 200, phrases[].speaker=0 on real audio):
+
+      * enhancedMode selects the model explicitly:
+          {"enabled": true, "task": "transcribe", "model": "MAI-Transcribe-2"}
+      * diarization is {"enabled": true} with NO maxSpeakers — MAI rejects
+        maxSpeakers with HTTP 400 "maxSpeakers is not supported for MAI
+        transcription yet."
+
+    Everything else — chunk framing, bare-bearer/key auth, the 401 self-heal,
+    transient-retry + loud escalation, and the phrases[] → "Speaker N: text"
+    formatter — is inherited unchanged. Because it is a chunked HTTP backend it
+    runs through `process_chunked_backend`, whose stop path is already bounded
+    (per-request `request_timeout` + final-partial flush), so there is no
+    unbounded SDK drain to worry about.
+
+    This is the new engine behind the `rtt`/`mai` path once its alias is
+    repointed; `llmspeech` (rttheb) and `azure` (rttold) are untouched.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        sample_rate: int,
+        chunk_seconds: float = 10.0,
+        api_version: str = "2025-10-15",
+        model: str = "MAI-Transcribe-2",
+        locales: Optional[List[str]] = None,
+        token_provider: Optional["TokenProvider"] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            endpoint=endpoint,
+            sample_rate=sample_rate,
+            chunk_seconds=chunk_seconds,
+            api_version=api_version,
+            locales=locales,
+            token_provider=token_provider,
+            api_key=api_key,
+        )
+        self._model = model
+
+    def _build_definition(self) -> dict:
+        """MAI definition: select the model, enable diarization, OMIT maxSpeakers.
+
+        Omitting maxSpeakers is load-bearing — the service returns HTTP 400
+        "maxSpeakers is not supported for MAI transcription yet." if it is sent.
+        """
+        definition: dict = {
+            "enhancedMode": {
+                "enabled": True,
+                "task": "transcribe",
+                "model": self._model,
+            },
+            "diarization": {"enabled": True},
+        }
+        if self._locales:
+            definition["locales"] = self._locales
+        return definition
+
+
+def process_chunked_backend(
+    backend: ChunkedHTTPBackend,
+    audio_queue: "queue.Queue[np.ndarray]",
+    stop_event: threading.Event,
+    paused_event: threading.Event,
+    emit,
+    poll_interval: float = 0.5,
+) -> None:
+    """Worker: drain audio queue → buffer → POST ready chunks → emit lines.
+
+    Mirrors process_azure_backend's contract so main() can dispatch it the
+    same way. On stop, flushes the final partial chunk so the tail of the
+    meeting isn't lost."""
+    backend.start()
+    last_poll = time.time()
+    try:
+        while not stop_event.is_set() or not audio_queue.empty():
+            if paused_event.is_set():
+                # Drop queued audio while paused (matches other backends).
+                while True:
+                    try:
+                        audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                time.sleep(0.1)
+                continue
+            try:
+                chunk = audio_queue.get(timeout=0.2)
+                backend.push_audio(chunk)
+            except queue.Empty:
+                pass
+            # Periodically flush any complete chunk.
+            if (time.time() - last_poll) >= poll_interval:
+                backend.transcribe_ready(force=False)
+                for line in backend.drain_text():
+                    emit(line)
+                last_poll = time.time()
+        # Fast file input can leave MANY chunks buffered at EOF. Each call
+        # consumes only one chunk, including force=True; drain all of them.
+        while backend._buffer.size:
+            backend.transcribe_ready(force=True)
+            for line in backend.drain_text():
+                emit(line)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Chunked backend worker failed: {exc}", err=True)
+        stop_event.set()
+    finally:
+        backend.stop()
+        for line in backend.drain_text():
+            emit(line)
