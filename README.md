@@ -37,13 +37,13 @@ Click a speaker's name to rename them everywhere, including the summary.
 | 🗣️ | **Stable speakers** | Voice embeddings keep "Speaker 1" the same person across chunks; click to rename |
 | 🔀 | **Six backends** | Local Whisper, Azure OpenAI diarize, Azure LLM Speech, MAI-Transcribe, classic Azure Speech, local VibeVoice. Switch live with `b` |
 | 🇮🇱 | **Mixed languages** | Hebrew/English code-switching on the LLM Speech and VibeVoice backends |
-| 📝 | **Live summary** | Summary, decisions, action items and open questions, updated as the meeting runs (optional) |
+| 📝 | **Live summary** | Summary, decisions, action items and open questions, updated as the meeting runs (on by default; `--no-summary` opts out) |
 | ⏸️ | **Session controls** | Pause, mute your mic, bookmark, off the record, undo, new session, resume after a crash |
 | 🏷️ | **Real names from Teams/Zoom** | Copy the app's own transcript, press `t`, and RTT puts the real names on its lines |
 | 🔤 | **Domain vocabulary** | Your list of terms (FHIR, DevOps, product names) is spelled right on every backend |
 | 🤖 | **Agent control** | `rtt-ctl` from any terminal, plus an MCP server so a coding agent can drive a session |
 | 🎙️ | **Recording** | `--record` saves meeting and mic tracks as FLAC; `rtt-post` re-transcribes them later |
-| 🔒 | **Private by default** | Transcripts and audio stay in local, git-ignored folders. The `local` backend sends nothing anywhere |
+| 🔒 | **Data destinations** | Whisper processes audio locally. Live summaries send transcript text to Copilot unless you opt out |
 
 ---
 
@@ -66,13 +66,21 @@ cd rtt
 The installer sets up a virtualenv, configures audio capture for your OS (on macOS it installs
 BlackHole and creates an `RTT Multi-Output` device) and runs a short audio smoke test.
 
-Then pick a backend:
+### Try a 20-second file first
+
+Run `.venv/bin/python demo/run.py` to transcribe the [synthetic garden recording](demo/README.md) with local Whisper, without a microphone or cloud summary. It prints the transcript path and uses its own temporary session. The first run may download the model; once cached, `HF_HUB_OFFLINE=1 .venv/bin/python demo/run.py` works offline. This demo does not change your normal summary setting.
+
+### Start a live session
+
+Pick a backend:
 
 ```bash
-./run.sh --backend local --model-size base   # fully local, no account needed
+./run.sh --backend local --model-size base   # local audio transcription; Copilot summaries on
 ./run-openai.sh                              # Azure OpenAI gpt-4o-transcribe-diarize
 ./run-llmspeech.sh                           # Azure LLM Speech, Hebrew + English
 ```
+
+Live summaries are **on by default**, even with local Whisper. Audio and transcript text have separate destinations; RTT prints both at startup. To turn summaries **off for one run**, add `--no-summary`. To **turn them back on**, pass `--summary`. For a persistent choice with the launch scripts, set `RTT_SUMMARY=0` (off) or `RTT_SUMMARY=1` (on) in `.env`; an explicit flag wins. Disabling summaries does not make an Azure audio backend local.
 
 Cloud backends need an Azure resource in your own subscription; copy `.env.example` to `.env`
 and fill in the endpoint. Sign-in uses `az login` (no keys needed). Check what RTT will use,
@@ -88,7 +96,7 @@ without recording anything:
 
 | Backend | Script | Runs on | Speakers | Best for |
 |---|---|---|---|---|
-| `local` | `run.sh` | Your machine (faster-whisper) | — | Offline, nothing leaves the machine |
+| `local` | `run.sh` | Your machine (faster-whisper) | — | On-device audio transcription |
 | `openai` | `run-openai.sh` | Azure OpenAI `gpt-4o-transcribe-diarize` | ✅ | English meetings, best accuracy per cost |
 | `llmspeech` | `run-llmspeech.sh` | Azure Speech LLM Speech | ✅ | Hebrew/English mixed meetings |
 | `mai` | `run-mai.sh` | Azure Speech MAI-Transcribe-2 | ✅ | Evaluation |

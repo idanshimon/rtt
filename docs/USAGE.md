@@ -180,7 +180,7 @@ From any terminal: `rtt-ctl status|pause|resume|mark "note"|mute|unmute|summariz
 Click a speaker line to rename it (also fixes the summary). `z` undoes; every action is logged in `sessions/<id>/actions.jsonl` (`rtt-ctl log`). Offline or from scripts: `rtt-align names|refine|tidy <transcript> <teams.txt|clip|->` (see meetalign/README.md). Copy the Teams/Zoom transcript and press `t` to put real names on the lines, or `T` to also take its wording and learn misheard names. Stopped by mistake? `rtt -c` picks the last session up again (`rtt --resume <id>` for a specific one; exit prints both). `o` = off the record (minutes, or click/paste a line's time to delete from that line on), `b` = switch backend live (arrows to choose, Enter to pick). Agents can drive all of this through the MCP server `rtt-mcp.sh` (openspec/features/mcp-server.md).
 Meeting watcher (offers to start RTT when a Teams/Zoom call grabs the mic): `./install-meeting-watch.sh`.
 `--record` saves audio (separate meeting/mic tracks) to `sessions/<id>/`; `rtt-post` re-transcribes it locally with VibeVoice.
-Live summary uses GitHub Copilot `gpt-6.1-terra` (`--no-summary` or `RTT_SUMMARY=0` to turn off). See `openspec/features/session-controls.md`.
+Live summary uses GitHub Copilot `gpt-6.1-terra` (on by default for every backend; `--no-summary` / `RTT_SUMMARY=0` to disable, `--summary` / `RTT_SUMMARY=1` to re-enable). See `openspec/features/session-controls.md`.
 
 
 **Auth:** Both reuse Azure AD via `DefaultAzureCredential` (fresh bearer token minted on demand, 30-min cache), or an API key if `AZURE_SPEECH_KEY` is set. The identity needs **Cognitive Services OpenAI User** (openai backend) or **Cognitive Services Speech User** (llmspeech backend) on the respective resource.

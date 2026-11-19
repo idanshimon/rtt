@@ -4,13 +4,13 @@
 
 | Backend | Audio goes to |
 |---|---|
-| `local` (Whisper) | Nowhere. Everything runs on your machine. |
+| `local` (Whisper) | Audio is processed on your machine. Live summaries are a separate setting (below). |
 | `openai`, `llmspeech`, `mai`, `azure` | The Azure resource **you** configure, in your own subscription. |
 | `vibe` | A VibeVoice server on `127.0.0.1` that you run yourself. |
-| Live summary (optional) | Transcript text goes to GitHub Copilot under your own `gh` sign-in. Turn it off with `--no-summary` or `RTT_SUMMARY=0`. |
+| Live summary (on by default for all audio backends) | Transcript text goes to GitHub Copilot under your own `gh` sign-in. Turn it off with `--no-summary` or `RTT_SUMMARY=0` in `.env`. Turn it back on with `--summary` or `RTT_SUMMARY=1`. This switch controls automatic summaries, not separately requested AI alignment. |
 
 Transcripts, recordings, summaries and the action log stay in local folders
-(`transcripts/`, `sessions/`, `private/`) that are git-ignored. RTT never commits or uploads them.
+(`transcripts/`, `sessions/`, `private/`) that are git-ignored. These local files are not committed. Remote processing above can still transmit their contents.
 
 ## Recording consent
 
